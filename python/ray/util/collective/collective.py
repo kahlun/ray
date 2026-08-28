@@ -34,6 +34,13 @@ try:
 except ImportError:
     pass
 
+try:
+    from ray.util.collective.collective_group.xccl_collective_group import XCCLGroup
+
+    register_collective_backend("XCCL", XCCLGroup)
+except ImportError:
+    pass
+
 
 def nccl_available():
     return is_backend_available("NCCL")
@@ -41,6 +48,10 @@ def nccl_available():
 
 def gloo_available():
     return is_backend_available("GLOO")
+
+
+def xccl_available():
+    return is_backend_available("XCCL")
 
 
 def is_backend_available(backend: str) -> bool:
