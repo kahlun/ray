@@ -44,6 +44,7 @@ class GpuProviderType(enum.Enum):
 
     NVIDIA = "nvidia"
     AMD = "amd"
+    INTEL = "intel"
 
 
 class ProcessGPUInfo(TypedDict):
@@ -634,13 +635,313 @@ class AmdGpuProvider(GpuProvider):
         return gpu_utilizations
 
 
+class IntelGpuProvider(GpuProvider):
+    """Intel GPU provider using pyzes (Level Zero Sysman).
+
+    ``pyzes`` is an optional dependency (``pip install pyzes``). Utilization
+    and power are derived from monotonic counters, so the first sample after
+    initialization reports them as ``None``. Utilization also stays ``None``
+    when Sysman exposes no engine groups, as on Arc Pro B60 with the current
+    driver stack.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._pyzes = None
+        self._devices = []
+        # device index -> (counter, timestamp_us) of the previous sample.
+        self._prev_engine: Dict[int, Tuple[int, int]] = {}
+        self._prev_energy: Dict[int, Tuple[int, int]] = {}
+
+    def get_provider_name(self) -> GpuProviderType:
+        return GpuProviderType.INTEL
+
+    def _enumerate(self, func, parent, handle_cls) -> list:
+        """Run the Level Zero count-then-fill enumeration pattern."""
+        import ctypes
+
+        count = ctypes.c_uint32(0)
+        if func(parent, ctypes.byref(count), None) != self._pyzes.ZE_RESULT_SUCCESS:
+            return []
+        if count.value == 0:
+            return []
+        handles = (handle_cls * count.value)()
+        if func(parent, ctypes.byref(count), handles) != self._pyzes.ZE_RESULT_SUCCESS:
+            return []
+        return list(handles[: count.value])
+
+    def _enumerate_devices(self) -> list:
+        pyzes = self._pyzes
+        devices = []
+        for driver in self._enumerate(
+            lambda parent, count, handles: pyzes.zesDriverGet(count, handles),
+            None,
+            pyzes.zes_driver_handle_t,
+        ):
+            devices.extend(
+                self._enumerate(pyzes.zesDeviceGet, driver, pyzes.zes_device_handle_t)
+            )
+        return devices
+
+    def is_available(self) -> bool:
+        """Check if Intel GPUs are available."""
+        try:
+            import pyzes
+
+            self._pyzes = pyzes
+            if pyzes.zesInit(0) != pyzes.ZE_RESULT_SUCCESS:
+                return False
+            return len(self._enumerate_devices()) > 0
+        except Exception as e:
+            logger.debug(f"Intel GPU not available: {e}")
+            return False
+
+    def _initialize(self) -> bool:
+        """Initialize the Intel GPU provider."""
+        if self._initialized:
+            return True
+
+        try:
+            import pyzes
+
+            self._pyzes = pyzes
+            if pyzes.zesInit(0) != pyzes.ZE_RESULT_SUCCESS:
+                return False
+            self._devices = self._enumerate_devices()
+            self._initialized = True
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to initialize Intel GPU provider: {e}")
+            return False
+
+    def _shutdown(self):
+        """Drop cached handles. Level Zero Sysman has no explicit shutdown."""
+        self._devices = []
+        self._prev_engine.clear()
+        self._prev_energy.clear()
+        self._initialized = False
+
+    @staticmethod
+    def _utf8(value) -> str:
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value).split(b"\0", 1)[0].decode("utf-8", "replace")
+        return str(value)
+
+    def _get_device_identity(self, handle) -> Tuple[str, str]:
+        import ctypes
+
+        pyzes = self._pyzes
+        props = pyzes.zes_device_properties_t()
+        props.stype = pyzes.ZES_STRUCTURE_TYPE_DEVICE_PROPERTIES
+        props.pNext = None
+        if pyzes.zesDeviceGetProperties(handle, ctypes.byref(props)) != (
+            pyzes.ZE_RESULT_SUCCESS
+        ):
+            return "Intel GPU", ""
+        name = self._utf8(props.modelName) or self._utf8(props.core.name)
+        return name or "Intel GPU", bytes(props.core.uuid.id).hex()
+
+    def _get_memory_mb(self, handle) -> Tuple[Megabytes, Megabytes]:
+        """Return (used, total) over the device-local memory modules."""
+        import ctypes
+
+        pyzes = self._pyzes
+        used = total = 0
+        for module in self._enumerate(
+            pyzes.zesDeviceEnumMemoryModules, handle, pyzes.zes_mem_handle_t
+        ):
+            props = pyzes.zes_mem_properties_t()
+            props.stype = pyzes.ZES_STRUCTURE_TYPE_MEM_PROPERTIES
+            props.pNext = None
+            if pyzes.zesMemoryGetProperties(module, ctypes.byref(props)) != (
+                pyzes.ZE_RESULT_SUCCESS
+            ) or props.location != (pyzes.ZES_MEM_LOC_DEVICE):
+                continue
+            state = pyzes.zes_mem_state_t()
+            state.stype = pyzes.ZES_STRUCTURE_TYPE_MEM_STATE
+            state.pNext = None
+            if pyzes.zesMemoryGetState(module, ctypes.byref(state)) != (
+                pyzes.ZE_RESULT_SUCCESS
+            ):
+                continue
+            total += int(state.size)
+            used += int(state.size) - int(state.free)
+        return used // MB, total // MB
+
+    def _get_utilization(self, index: int, handle) -> Optional[Percentage]:
+        """Busy percentage of the ``ALL`` engine group since the last sample."""
+        import ctypes
+
+        pyzes = self._pyzes
+        active = timestamp = n = 0
+        for engine in self._enumerate(
+            pyzes.zesDeviceEnumEngineGroups, handle, pyzes.zes_engine_handle_t
+        ):
+            props = pyzes.zes_engine_properties_t()
+            props.stype = pyzes.ZES_STRUCTURE_TYPE_ENGINE_PROPERTIES
+            props.pNext = None
+            if (
+                pyzes.zesEngineGetProperties(engine, ctypes.byref(props))
+                != pyzes.ZE_RESULT_SUCCESS
+                or props.type != pyzes.ZES_ENGINE_GROUP_ALL
+            ):
+                continue
+            stats = pyzes.zes_engine_stats_t()
+            if pyzes.zesEngineGetActivity(engine, ctypes.byref(stats)) != (
+                pyzes.ZE_RESULT_SUCCESS
+            ):
+                continue
+            # One ALL group per sub-device: average their busy time.
+            active += int(stats.activeTime)
+            timestamp = max(timestamp, int(stats.timestamp))
+            n += 1
+        if n == 0:
+            return None
+        previous = self._prev_engine.get(index)
+        self._prev_engine[index] = (active, timestamp)
+        if previous is None or timestamp <= previous[1]:
+            return None
+        busy = (active - previous[0]) / n / (timestamp - previous[1])
+        return max(0, min(100, int(round(busy * 100))))
+
+    def _get_power_mw(self, index: int, handle) -> Optional[int]:
+        """Average power in mW since the last sample, from the energy counter."""
+        import ctypes
+
+        pyzes = self._pyzes
+        for domain in self._enumerate(
+            pyzes.zesDeviceEnumPowerDomains, handle, pyzes.zes_pwr_handle_t
+        ):
+            props = pyzes.zes_power_properties_t()
+            props.stype = pyzes.ZES_STRUCTURE_TYPE_POWER_PROPERTIES
+            props.pNext = None
+            if pyzes.zesPowerGetProperties(domain, ctypes.byref(props)) != (
+                pyzes.ZE_RESULT_SUCCESS
+            ) or bool(props.onSubdevice):
+                continue
+            energy = pyzes.zes_power_energy_counter_t()
+            if pyzes.zesPowerGetEnergyCounter(domain, ctypes.byref(energy)) != (
+                pyzes.ZE_RESULT_SUCCESS
+            ):
+                return None
+            previous = self._prev_energy.get(index)
+            self._prev_energy[index] = (int(energy.energy), int(energy.timestamp))
+            if previous is None or int(energy.timestamp) <= previous[1]:
+                return None
+            # microjoules / microseconds = watts
+            watts = (int(energy.energy) - previous[0]) / (
+                int(energy.timestamp) - previous[1]
+            )
+            return int(watts * 1000)
+        return None
+
+    def _get_temperature_c(self, handle) -> Optional[int]:
+        import ctypes
+
+        pyzes = self._pyzes
+        for sensor in self._enumerate(
+            pyzes.zesDeviceEnumTemperatureSensors, handle, pyzes.zes_temp_handle_t
+        ):
+            props = pyzes.zes_temp_properties_t()
+            props.stype = pyzes.ZES_STRUCTURE_TYPE_TEMP_PROPERTIES
+            props.pNext = None
+            if (
+                pyzes.zesTemperatureGetProperties(sensor, ctypes.byref(props))
+                != pyzes.ZE_RESULT_SUCCESS
+                or props.type != pyzes.ZES_TEMP_SENSORS_GPU
+            ):
+                continue
+            value = ctypes.c_double(0)
+            if pyzes.zesTemperatureGetState(sensor, ctypes.byref(value)) == (
+                pyzes.ZE_RESULT_SUCCESS
+            ):
+                return int(value.value)
+        return None
+
+    def _get_processes(self, handle) -> Dict[int, ProcessGPUInfo]:
+        import ctypes
+
+        pyzes = self._pyzes
+        count = ctypes.c_uint32(0)
+        if (
+            pyzes.zesDeviceProcessesGetState(handle, ctypes.byref(count), None)
+            != (pyzes.ZE_RESULT_SUCCESS)
+            or count.value == 0
+        ):
+            return {}
+        states = (pyzes.zes_process_state_t * count.value)()
+        for state in states:
+            state.stype = pyzes.ZES_STRUCTURE_TYPE_PROCESS_STATE
+            state.pNext = None
+        if pyzes.zesDeviceProcessesGetState(handle, ctypes.byref(count), states) != (
+            pyzes.ZE_RESULT_SUCCESS
+        ):
+            return {}
+        return {
+            int(state.processId): ProcessGPUInfo(
+                pid=int(state.processId),
+                gpu_memory_usage=int(state.memSize) // MB,
+                gpu_utilization=None,
+            )
+            for state in states[: count.value]
+        }
+
+    def _optional(self, what: str, fn, *args):
+        """Optional fields must never drop the whole device record."""
+        try:
+            return fn(*args)
+        except Exception as e:
+            logger.debug(f"Failed to retrieve Intel GPU {what}: {e}")
+            return None
+
+    def get_gpu_utilization(self) -> List[GpuUtilizationInfo]:
+        """Get GPU utilization information for all Intel GPUs."""
+        if not self._initialized:
+            if not self._initialize():
+                return []
+
+        gpu_utilizations = []
+
+        try:
+            for index, handle in enumerate(self._devices):
+                name, uuid = self._get_device_identity(handle)
+                memory_used, memory_total = self._get_memory_mb(handle)
+                info = GpuUtilizationInfo(
+                    index=index,
+                    name=name,
+                    uuid=uuid,
+                    utilization_gpu=self._optional(
+                        "utilization", self._get_utilization, index, handle
+                    ),
+                    memory_used=memory_used,
+                    memory_total=memory_total,
+                    processes_pids=self._optional(
+                        "processes", self._get_processes, handle
+                    )
+                    or {},
+                    power_mw=self._optional("power", self._get_power_mw, index, handle),
+                    temperature_c=self._optional(
+                        "temperature", self._get_temperature_c, handle
+                    ),
+                )
+                gpu_utilizations.append(info)
+        except Exception as e:
+            logger.warning(f"Error getting Intel GPU utilization: {e}")
+
+        return gpu_utilizations
+
+
 class GpuMetricProvider:
     """Provider class for GPU metrics collection."""
 
     def __init__(self):
         self._provider: Optional[GpuProvider] = None
         self._enable_metric_report = True
-        self._providers = [NvidiaGpuProvider(), AmdGpuProvider()]
+        self._providers = [
+            NvidiaGpuProvider(),
+            AmdGpuProvider(),
+            IntelGpuProvider(),
+        ]
         self._initialized = False
 
     def initialize(self) -> bool:
