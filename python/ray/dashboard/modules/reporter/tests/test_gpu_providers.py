@@ -1,6 +1,8 @@
 """Unit tests for GPU providers."""
 
+import ctypes
 import os
+import sys
 import unittest
 from unittest.mock import Mock, call, patch
 
@@ -13,6 +15,7 @@ from ray.dashboard.modules.reporter.gpu_providers import (
     GpuProvider,
     GpuProviderType,
     GpuUtilizationInfo,
+    IntelGpuProvider,
     NvidiaGpuProvider,
     ProcessGPUInfo,
 )
@@ -129,8 +132,8 @@ class TestNvidiaGpuProvider(unittest.TestCase):
         mock_pynvml.nvmlDeviceGetName.side_effect = lambda handle: gpu_names[
             gpu_indices[handle]
         ].encode()
-        mock_pynvml.nvmlDeviceGetUUID.side_effect = (
-            lambda handle: f"GPU-{gpu_indices[handle]}".encode()
+        mock_pynvml.nvmlDeviceGetUUID.side_effect = lambda handle: (
+            f"GPU-{gpu_indices[handle]}".encode()
         )
         mock_pynvml.nvmlDeviceGetMigMode.return_value = (False, False)
         mock_pynvml.nvmlDeviceGetMemoryInfo.side_effect = lambda handle: Mock(
@@ -744,6 +747,281 @@ class TestAmdGpuProvider(unittest.TestCase):
         self.assertEqual(gpu_info["processes_pids"][5678]["gpu_memory_usage"], 512)
 
 
+def _make_fake_pyzes():
+    """A minimal in-memory stand-in for ``pyzes`` (Level Zero Sysman).
+
+    One device with 8 GiB of device memory (2 GiB used), one ALL engine group,
+    one card-level power domain and one GPU temperature sensor. Engine activity
+    and energy advance by a fixed step on every read.
+    """
+    z = type(sys)("pyzes")
+    z.ZE_RESULT_SUCCESS = 0
+    for name in (
+        "driver_handle",
+        "device_handle",
+        "mem_handle",
+        "pwr_handle",
+        "temp_handle",
+        "engine_handle",
+    ):
+        setattr(z, f"zes_{name}_t", type(f"zes_{name}_t", (ctypes.c_void_p,), {}))
+
+    def struct(name, fields):
+        setattr(
+            z,
+            name,
+            type(name, (ctypes.Structure,), {"_fields_": [(f, t) for f, t in fields]}),
+        )
+
+    u32, u64, i32 = ctypes.c_uint32, ctypes.c_uint64, ctypes.c_int32
+    uuid = ctypes.c_ubyte * 16
+    str_ = ctypes.c_char * 32
+    struct("_uuid", [("id", uuid)])
+    struct("_core", [("name", str_), ("uuid", z._uuid)])
+    struct(
+        "zes_device_properties_t",
+        [
+            ("stype", i32),
+            ("pNext", ctypes.c_void_p),
+            ("core", z._core),
+            ("modelName", str_),
+        ],
+    )
+    struct(
+        "zes_mem_properties_t",
+        [("stype", i32), ("pNext", ctypes.c_void_p), ("location", i32)],
+    )
+    struct(
+        "zes_mem_state_t",
+        [("stype", i32), ("pNext", ctypes.c_void_p), ("free", u64), ("size", u64)],
+    )
+    struct(
+        "zes_engine_properties_t",
+        [("stype", i32), ("pNext", ctypes.c_void_p), ("type", i32)],
+    )
+    struct("zes_engine_stats_t", [("activeTime", u64), ("timestamp", u64)])
+    struct(
+        "zes_power_properties_t",
+        [("stype", i32), ("pNext", ctypes.c_void_p), ("onSubdevice", ctypes.c_uint8)],
+    )
+    struct("zes_power_energy_counter_t", [("energy", u64), ("timestamp", u64)])
+    struct(
+        "zes_temp_properties_t",
+        [("stype", i32), ("pNext", ctypes.c_void_p), ("type", i32)],
+    )
+    struct(
+        "zes_process_state_t",
+        [
+            ("stype", i32),
+            ("pNext", ctypes.c_void_p),
+            ("processId", u32),
+            ("memSize", u64),
+        ],
+    )
+    for const, value in {
+        "ZES_STRUCTURE_TYPE_DEVICE_PROPERTIES": 1,
+        "ZES_STRUCTURE_TYPE_MEM_PROPERTIES": 0xB,
+        "ZES_STRUCTURE_TYPE_MEM_STATE": 0x1E,
+        "ZES_STRUCTURE_TYPE_ENGINE_PROPERTIES": 5,
+        "ZES_STRUCTURE_TYPE_POWER_PROPERTIES": 0xD,
+        "ZES_STRUCTURE_TYPE_TEMP_PROPERTIES": 0x14,
+        "ZES_STRUCTURE_TYPE_PROCESS_STATE": 0x16,
+        "ZES_MEM_LOC_DEVICE": 1,
+        "ZES_ENGINE_GROUP_ALL": 0,
+        "ZES_TEMP_SENSORS_GPU": 1,
+    }.items():
+        setattr(z, const, value)
+
+    clock = {"n": 0}
+
+    def fill(count, handles, cls, n):
+        count._obj.value = n
+        if handles is not None:
+            for i in range(n):
+                handles[i] = cls(i + 1)
+        return 0
+
+    z.zesInit = lambda flags: 0
+    z.zesDriverGet = lambda count, h: fill(count, h, z.zes_driver_handle_t, 1)
+    z.zesDeviceGet = lambda d, count, h: fill(count, h, z.zes_device_handle_t, 1)
+    z.zesDeviceEnumMemoryModules = lambda d, count, h: fill(
+        count, h, z.zes_mem_handle_t, 2
+    )
+    z.zesDeviceEnumEngineGroups = lambda d, count, h: fill(
+        count, h, z.zes_engine_handle_t, 1
+    )
+    z.zesDeviceEnumPowerDomains = lambda d, count, h: fill(
+        count, h, z.zes_pwr_handle_t, 1
+    )
+    z.zesDeviceEnumTemperatureSensors = lambda d, count, h: fill(
+        count, h, z.zes_temp_handle_t, 1
+    )
+
+    def device_props(d, p):
+        p._obj.modelName = b"Intel(R) Arc(TM) Pro B60"
+        return 0
+
+    z.zesDeviceGetProperties = device_props
+
+    def mem_props(m, p):
+        # Module 1 is device memory, module 2 is host-visible and must be ignored.
+        p._obj.location = 1 if m.value == 1 else 2
+        return 0
+
+    z.zesMemoryGetProperties = mem_props
+
+    def mem_state(m, s):
+        s._obj.size = 8 * 1024 * MB
+        s._obj.free = 6 * 1024 * MB
+        return 0
+
+    z.zesMemoryGetState = mem_state
+    z.zesEngineGetProperties = lambda e, p: 0
+
+    def activity(e, s):
+        clock["n"] += 1
+        s._obj.timestamp = clock["n"] * 1_000_000
+        s._obj.activeTime = clock["n"] * 250_000  # 25% busy
+        return 0
+
+    z.zesEngineGetActivity = activity
+    z.zesPowerGetProperties = lambda p, props: 0
+
+    def energy(p, c):
+        clock["e"] = clock.get("e", 0) + 1
+        c._obj.timestamp = clock["e"] * 1_000_000
+        c._obj.energy = clock["e"] * 80_000_000  # 80 W
+        return 0
+
+    z.zesPowerGetEnergyCounter = energy
+
+    def temp_props(t, p):
+        p._obj.type = 1
+        return 0
+
+    z.zesTemperatureGetProperties = temp_props
+
+    def temp_state(t, v):
+        v._obj.value = 61.5
+        return 0
+
+    z.zesTemperatureGetState = temp_state
+
+    def processes(d, count, states):
+        count._obj.value = 1
+        if states is not None:
+            states[0].processId = 4242
+            states[0].memSize = 512 * MB
+        return 0
+
+    z.zesDeviceProcessesGetState = processes
+    return z
+
+
+class TestIntelGpuProvider(unittest.TestCase):
+    """Test IntelGpuProvider class against a fake pyzes."""
+
+    def setUp(self):
+        self.provider = IntelGpuProvider()
+        self.fake = _make_fake_pyzes()
+        patcher = patch.dict(sys.modules, {"pyzes": self.fake})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_get_provider_name(self):
+        self.assertEqual(self.provider.get_provider_name(), GpuProviderType.INTEL)
+
+    def test_is_available_success(self):
+        self.assertTrue(self.provider.is_available())
+
+    def test_is_available_without_pyzes(self):
+        with patch.dict(sys.modules, {"pyzes": None}):
+            self.assertFalse(IntelGpuProvider().is_available())
+
+    def test_is_available_init_failure(self):
+        self.fake.zesInit = lambda flags: 1
+        self.assertFalse(self.provider.is_available())
+
+    def test_is_available_no_devices(self):
+        self.fake.zesDeviceGet = lambda d, count, h: (
+            setattr(count._obj, "value", 0) or 0
+        )
+        self.assertFalse(self.provider.is_available())
+
+    def test_initialize_failure(self):
+        self.fake.zesInit = lambda flags: 1
+        self.assertFalse(self.provider._initialize())
+        self.assertFalse(self.provider._initialized)
+        self.assertEqual(self.provider.get_gpu_utilization(), [])
+
+    def test_get_gpu_utilization_first_sample(self):
+        result = self.provider.get_gpu_utilization()
+
+        self.assertEqual(len(result), 1)
+        gpu = result[0]
+        self.assertEqual(gpu["index"], 0)
+        self.assertEqual(gpu["name"], "Intel(R) Arc(TM) Pro B60")
+        # Only the device-local memory module counts: 8 GiB total, 2 GiB used.
+        self.assertEqual(gpu["memory_total"], 8 * 1024)
+        self.assertEqual(gpu["memory_used"], 2 * 1024)
+        # Counter-derived values need a previous sample.
+        self.assertIsNone(gpu["utilization_gpu"])
+        self.assertIsNone(gpu["power_mw"])
+        self.assertEqual(gpu["temperature_c"], 61)
+        self.assertEqual(
+            gpu["processes_pids"],
+            {
+                4242: ProcessGPUInfo(
+                    pid=4242, gpu_memory_usage=512, gpu_utilization=None
+                )
+            },
+        )
+
+    def test_get_gpu_utilization_second_sample(self):
+        self.provider.get_gpu_utilization()
+        gpu = self.provider.get_gpu_utilization()[0]
+
+        self.assertEqual(gpu["utilization_gpu"], 25)
+        self.assertEqual(gpu["power_mw"], 80_000)
+
+    def test_no_engine_groups_leaves_utilization_unset(self):
+        self.fake.zesDeviceEnumEngineGroups = lambda d, count, h: (
+            setattr(count._obj, "value", 0) or 0
+        )
+        self.provider.get_gpu_utilization()
+        gpu = self.provider.get_gpu_utilization()[0]
+
+        self.assertIsNone(gpu["utilization_gpu"])
+        # The other fields are unaffected.
+        self.assertEqual(gpu["power_mw"], 80_000)
+        self.assertEqual(gpu["memory_total"], 8 * 1024)
+
+    def test_optional_field_failure_keeps_device(self):
+        def boom(*args):
+            raise RuntimeError("sensor gone")
+
+        self.fake.zesTemperatureGetState = boom
+        gpu = self.provider.get_gpu_utilization()[0]
+
+        self.assertIsNone(gpu["temperature_c"])
+        self.assertEqual(gpu["memory_total"], 8 * 1024)
+
+    def test_shutdown_resets_state(self):
+        self.provider.get_gpu_utilization()
+        self.provider.get_gpu_utilization()
+        self.provider._shutdown()
+
+        self.assertFalse(self.provider._initialized)
+        self.assertIsNone(self.provider.get_gpu_utilization()[0]["utilization_gpu"])
+
+    def test_metric_provider_detects_intel(self):
+        metric_provider = GpuMetricProvider()
+        metric_provider._providers = [IntelGpuProvider()]
+
+        self.assertTrue(metric_provider.initialize())
+        self.assertEqual(metric_provider.get_provider_name(), "intel")
+
+
 class TestGpuMetricProvider(unittest.TestCase):
     """Test GpuMetricProvider class."""
 
@@ -755,7 +1033,7 @@ class TestGpuMetricProvider(unittest.TestCase):
         """Test GpuMetricProvider initialization."""
         self.assertIsNone(self.provider._provider)
         self.assertTrue(self.provider._enable_metric_report)
-        self.assertEqual(len(self.provider._providers), 2)
+        self.assertEqual(len(self.provider._providers), 3)
         self.assertFalse(self.provider._initialized)
 
     @patch.object(NvidiaGpuProvider, "is_available", return_value=True)
