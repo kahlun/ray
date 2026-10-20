@@ -3,7 +3,12 @@ load("//bazel:python.bzl", "doctest")
 doctest(
     files = glob(
         ["**/*.py"],
-        exclude = ["**/thirdparty_files/**"],
+        exclude = [
+            "**/thirdparty_files/**",
+            # Importing pyzes loads libze_loader, so it can't be collected on
+            # hosts without the Intel GPU driver.
+            "thirdparty/pyzes/**",
+        ],
     ),
     tags = ["team:core"],
 )

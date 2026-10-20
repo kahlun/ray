@@ -770,7 +770,7 @@ def _make_fake_pyzes():
         setattr(
             z,
             name,
-            type(name, (ctypes.Structure,), {"_fields_": [(f, t) for f, t in fields]}),
+            type(name, (ctypes.Structure,), {"_fields_": list(fields)}),
         )
 
     u32, u64, i32 = ctypes.c_uint32, ctypes.c_uint64, ctypes.c_int32
@@ -918,25 +918,29 @@ def _make_fake_pyzes():
     return z
 
 
+_PYZES = "ray._private.thirdparty.pyzes"
+
+
 class TestIntelGpuProvider(unittest.TestCase):
     """Test IntelGpuProvider class against a fake pyzes."""
 
     def setUp(self):
         self.provider = IntelGpuProvider()
         self.fake = _make_fake_pyzes()
-        patcher = patch.dict(sys.modules, {"pyzes": self.fake})
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # The real pyzes can't be imported without libze_loader, so register
+        # the fake both as the module and as the package attribute.
+        for patcher in (
+            patch.dict(sys.modules, {_PYZES: self.fake}),
+            patch(_PYZES, self.fake, create=True),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_get_provider_name(self):
         self.assertEqual(self.provider.get_provider_name(), GpuProviderType.INTEL)
 
     def test_is_available_success(self):
         self.assertTrue(self.provider.is_available())
-
-    def test_is_available_without_pyzes(self):
-        with patch.dict(sys.modules, {"pyzes": None}):
-            self.assertFalse(IntelGpuProvider().is_available())
 
     def test_is_available_init_failure(self):
         self.fake.zesInit = lambda flags: 1
@@ -1022,6 +1026,32 @@ class TestIntelGpuProvider(unittest.TestCase):
         self.assertEqual(metric_provider.get_provider_name(), "intel")
 
 
+class TestIntelGpuProviderWithoutDriver(unittest.TestCase):
+    """Import the real vendored pyzes on a host with no libze_loader."""
+
+    def setUp(self):
+        # Force a fresh import even if pyzes was already loaded in this process.
+        patcher = patch.dict(sys.modules)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in (_PYZES, f"{_PYZES}.pyzes"):
+            sys.modules.pop(name, None)
+        patcher = patch(
+            "ctypes.CDLL", side_effect=OSError("cannot open shared object file")
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_is_available_without_driver(self):
+        self.assertFalse(IntelGpuProvider().is_available())
+
+    def test_initialize_without_driver(self):
+        provider = IntelGpuProvider()
+
+        self.assertFalse(provider._initialize())
+        self.assertEqual(provider.get_gpu_utilization(), [])
+
+
 class TestGpuMetricProvider(unittest.TestCase):
     """Test GpuMetricProvider class."""
 
@@ -1059,7 +1089,24 @@ class TestGpuMetricProvider(unittest.TestCase):
 
     @patch.object(NvidiaGpuProvider, "is_available", return_value=False)
     @patch.object(AmdGpuProvider, "is_available", return_value=False)
-    def test_detect_gpu_provider_none(self, mock_amd_available, mock_nvidia_available):
+    @patch.object(IntelGpuProvider, "is_available", return_value=True)
+    def test_detect_gpu_provider_intel(
+        self, mock_intel_available, mock_amd_available, mock_nvidia_available
+    ):
+        """Test GPU provider detection when Intel is available."""
+        provider = self.provider._detect_gpu_provider()
+
+        self.assertIsInstance(provider, IntelGpuProvider)
+        mock_nvidia_available.assert_called_once()
+        mock_amd_available.assert_called_once()
+        mock_intel_available.assert_called_once()
+
+    @patch.object(NvidiaGpuProvider, "is_available", return_value=False)
+    @patch.object(AmdGpuProvider, "is_available", return_value=False)
+    @patch.object(IntelGpuProvider, "is_available", return_value=False)
+    def test_detect_gpu_provider_none(
+        self, mock_intel_available, mock_amd_available, mock_nvidia_available
+    ):
         """Test GPU provider detection when no GPUs are available."""
         provider = self.provider._detect_gpu_provider()
 

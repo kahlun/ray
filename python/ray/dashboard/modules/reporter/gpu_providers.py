@@ -636,13 +636,13 @@ class AmdGpuProvider(GpuProvider):
 
 
 class IntelGpuProvider(GpuProvider):
-    """Intel GPU provider using pyzes (Level Zero Sysman).
+    """Intel GPU provider using the vendored pyzes (Level Zero Sysman).
 
-    ``pyzes`` is an optional dependency (``pip install pyzes``). Utilization
-    and power are derived from monotonic counters, so the first sample after
-    initialization reports them as ``None``. Utilization also stays ``None``
-    when Sysman exposes no engine groups, as on Arc Pro B60 with the current
-    driver stack.
+    pyzes needs the Level Zero loader (``libze_loader``) from the Intel GPU
+    driver at runtime. Utilization and power are derived from monotonic
+    counters, so the first sample after initialization reports them as
+    ``None``. Utilization also stays ``None`` when Sysman exposes no engine
+    groups, as on Arc Pro B60 with the current driver stack.
     """
 
     def __init__(self):
@@ -683,15 +683,23 @@ class IntelGpuProvider(GpuProvider):
             )
         return devices
 
+    def _load_pyzes(self) -> bool:
+        """Import pyzes and initialize Sysman.
+
+        pyzes loads libze_loader at import time, so on a host without the
+        Intel GPU driver the import itself raises. Callers handle that.
+        """
+        import ray._private.thirdparty.pyzes as pyzes
+
+        if pyzes.zesInit(0) != pyzes.ZE_RESULT_SUCCESS:
+            return False
+        self._pyzes = pyzes
+        return True
+
     def is_available(self) -> bool:
         """Check if Intel GPUs are available."""
         try:
-            import pyzes
-
-            self._pyzes = pyzes
-            if pyzes.zesInit(0) != pyzes.ZE_RESULT_SUCCESS:
-                return False
-            return len(self._enumerate_devices()) > 0
+            return self._load_pyzes() and len(self._enumerate_devices()) > 0
         except Exception as e:
             logger.debug(f"Intel GPU not available: {e}")
             return False
@@ -702,10 +710,7 @@ class IntelGpuProvider(GpuProvider):
             return True
 
         try:
-            import pyzes
-
-            self._pyzes = pyzes
-            if pyzes.zesInit(0) != pyzes.ZE_RESULT_SUCCESS:
+            if not self._load_pyzes():
                 return False
             self._devices = self._enumerate_devices()
             self._initialized = True
