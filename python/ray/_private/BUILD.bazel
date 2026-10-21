@@ -13,6 +13,12 @@ doctest(
     tags = ["team:core"],
 )
 
+# The loader test imports this file by path to run it with dlopen mocked.
+exports_files(
+    ["thirdparty/pyzes/pyzes.py"],
+    visibility = ["//python/ray/_private/thirdparty/pyzes/tests:__pkg__"],
+)
+
 filegroup(
     name = "src_files",
     srcs = glob(

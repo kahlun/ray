@@ -921,6 +921,15 @@ def _make_fake_pyzes():
 _PYZES = "ray._private.thirdparty.pyzes"
 
 
+def _fill_handles(fake, count, handles, n):
+    """Mimic the two-call Level Zero enumeration for ``n`` engine groups."""
+    count._obj.value = n
+    if handles is not None:
+        for i in range(n):
+            handles[i] = fake.zes_engine_handle_t(i + 1)
+    return 0
+
+
 class TestIntelGpuProvider(unittest.TestCase):
     """Test IntelGpuProvider class against a fake pyzes."""
 
@@ -999,6 +1008,34 @@ class TestIntelGpuProvider(unittest.TestCase):
         # The other fields are unaffected.
         self.assertEqual(gpu["power_mw"], 80_000)
         self.assertEqual(gpu["memory_total"], 8 * 1024)
+
+    def test_partial_engine_read_failure_resets_utilization_baseline(self):
+        """A failed read on one of several ALL groups must not skew the next value."""
+        state = {"tick": 0, "failing": None}
+
+        def activity(e, s):
+            if e.value == state["failing"]:
+                return 1
+            s._obj.timestamp = state["tick"] * 1_000_000
+            s._obj.activeTime = state["tick"] * 250_000  # 25% busy
+            return 0
+
+        self.fake.zesDeviceEnumEngineGroups = lambda d, count, h: (
+            _fill_handles(self.fake, count, h, 2)
+        )
+        self.fake.zesEngineGetActivity = activity
+
+        def sample(tick, failing=None):
+            state.update(tick=tick, failing=failing)
+            return self.provider.get_gpu_utilization()[0]["utilization_gpu"]
+
+        self.assertIsNone(sample(1))  # first sample only sets the baseline
+        self.assertEqual(sample(2), 25)
+        # Engine 2 fails: the sum would cover engine 1 only, so report nothing.
+        self.assertIsNone(sample(3, failing=2))
+        # Recovery has no baseline to diff against yet, so no spike either.
+        self.assertIsNone(sample(4))
+        self.assertEqual(sample(5), 25)
 
     def test_optional_field_failure_keeps_device(self):
         def boom(*args):

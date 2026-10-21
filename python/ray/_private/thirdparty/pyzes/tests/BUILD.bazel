@@ -4,5 +4,6 @@ py_test(
     name = "test_pyzes",
     size = "small",
     srcs = ["test_pyzes.py"],
+    data = ["//python/ray/_private:thirdparty/pyzes/pyzes.py"],
     tags = ["team:core"],
 )
