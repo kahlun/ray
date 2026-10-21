@@ -773,6 +773,16 @@ class IntelGpuProvider(GpuProvider):
             used += int(state.size) - int(state.free)
         return used // MB, total // MB
 
+    def _drop_engine_baseline(self, index: int) -> None:
+        """Forget the last engine sample after a failed read.
+
+        The counters are lifetime totals summed over the sub-devices, so a
+        partial sum would be diffed against a full one and report a false
+        dip, then a spike once the read recovers.
+        """
+        self._prev_engine.pop(index, None)
+        return None
+
     def _get_utilization(self, index: int, handle) -> Optional[Percentage]:
         """Busy percentage of the ``ALL`` engine group since the last sample."""
         import ctypes
@@ -785,17 +795,17 @@ class IntelGpuProvider(GpuProvider):
             props = pyzes.zes_engine_properties_t()
             props.stype = pyzes.ZES_STRUCTURE_TYPE_ENGINE_PROPERTIES
             props.pNext = None
-            if (
-                pyzes.zesEngineGetProperties(engine, ctypes.byref(props))
-                != pyzes.ZE_RESULT_SUCCESS
-                or props.type != pyzes.ZES_ENGINE_GROUP_ALL
+            if pyzes.zesEngineGetProperties(engine, ctypes.byref(props)) != (
+                pyzes.ZE_RESULT_SUCCESS
             ):
+                return self._drop_engine_baseline(index)
+            if props.type != pyzes.ZES_ENGINE_GROUP_ALL:
                 continue
             stats = pyzes.zes_engine_stats_t()
             if pyzes.zesEngineGetActivity(engine, ctypes.byref(stats)) != (
                 pyzes.ZE_RESULT_SUCCESS
             ):
-                continue
+                return self._drop_engine_baseline(index)
             # One ALL group per sub-device: average their busy time.
             active += int(stats.activeTime)
             timestamp = max(timestamp, int(stats.timestamp))
