@@ -1009,6 +1009,40 @@ class TestIntelGpuProvider(unittest.TestCase):
         self.assertEqual(gpu["power_mw"], 80_000)
         self.assertEqual(gpu["memory_total"], 8 * 1024)
 
+    def test_power_domain_switch_does_not_mix_energy_counters(self):
+        """A skipped first domain must not make the second diff against its counter."""
+        state = {"tick": 0, "props_fail": False}
+
+        def domains(d, count, handles):
+            count._obj.value = 2
+            if handles is not None:
+                for i in range(2):
+                    handles[i] = self.fake.zes_pwr_handle_t(i + 1)
+            return 0
+
+        self.fake.zesDeviceEnumPowerDomains = domains
+
+        def props(p, out):
+            return 1 if state["props_fail"] and p.value == 1 else 0
+
+        def energy(p, c):
+            c._obj.timestamp = state["tick"] * 1_000_000
+            # Domain 1 draws 80 W; domain 2 is an unrelated counter with a huge offset.
+            watts, offset = (80, 0) if p.value == 1 else (40, 5_000_000_000)
+            c._obj.energy = offset + state["tick"] * watts * 1_000_000
+            return 0
+
+        self.fake.zesPowerGetProperties = props
+        self.fake.zesPowerGetEnergyCounter = energy
+
+        def sample(tick, props_fail=False):
+            state.update(tick=tick, props_fail=props_fail)
+            return self.provider.get_gpu_utilization()[0]["power_mw"]
+
+        self.assertIsNone(sample(1))  # baseline for domain 1
+        self.assertIsNone(sample(2, props_fail=True))  # domain 2 has no baseline yet
+        self.assertEqual(sample(3), 80_000)  # domain 1 again, over two ticks
+
     def test_partial_engine_read_failure_resets_utilization_baseline(self):
         """A failed read on one of several ALL groups must not skew the next value."""
         state = {"tick": 0, "failing": None}
