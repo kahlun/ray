@@ -804,6 +804,10 @@ def _make_fake_pyzes():
         "zes_power_properties_t",
         [("stype", i32), ("pNext", ctypes.c_void_p), ("onSubdevice", ctypes.c_uint8)],
     )
+    struct(
+        "zes_power_ext_properties_t",
+        [("stype", i32), ("pNext", ctypes.c_void_p), ("domain", i32)],
+    )
     struct("zes_power_energy_counter_t", [("energy", u64), ("timestamp", u64)])
     struct(
         "zes_temp_properties_t",
@@ -824,6 +828,9 @@ def _make_fake_pyzes():
         "ZES_STRUCTURE_TYPE_MEM_STATE": 0x1E,
         "ZES_STRUCTURE_TYPE_ENGINE_PROPERTIES": 5,
         "ZES_STRUCTURE_TYPE_POWER_PROPERTIES": 0xD,
+        "ZES_STRUCTURE_TYPE_POWER_EXT_PROPERTIES": 0x28,
+        "ZES_POWER_DOMAIN_CARD": 1,
+        "ZES_POWER_DOMAIN_PACKAGE": 2,
         "ZES_STRUCTURE_TYPE_TEMP_PROPERTIES": 0x14,
         "ZES_STRUCTURE_TYPE_PROCESS_STATE": 0x16,
         "ZES_MEM_LOC_DEVICE": 1,
@@ -1008,6 +1015,76 @@ class TestIntelGpuProvider(unittest.TestCase):
         # The other fields are unaffected.
         self.assertEqual(gpu["power_mw"], 80_000)
         self.assertEqual(gpu["memory_total"], 8 * 1024)
+
+    def test_engine_utilization_is_averaged_per_engine_interval(self):
+        """Two 25%-busy engines sampled over 1 s and 2 s must still read 25%."""
+        # engine handle -> (activeTime, timestamp) of the current sample, in us.
+        state = {1: (0, 0), 2: (0, 0)}
+
+        self.fake.zesDeviceEnumEngineGroups = lambda d, count, h: (
+            _fill_handles(self.fake, count, h, 2)
+        )
+
+        def activity(e, s):
+            s._obj.activeTime, s._obj.timestamp = state[e.value]
+            return 0
+
+        self.fake.zesEngineGetActivity = activity
+
+        def sample(engine1, engine2):
+            state[1], state[2] = engine1, engine2
+            return self.provider.get_gpu_utilization()[0]["utilization_gpu"]
+
+        self.assertIsNone(sample((0, 0), (0, 0)))
+        # Engine 1 advanced 1 s (250 ms busy), engine 2 advanced 2 s (500 ms busy).
+        self.assertEqual(sample((250_000, 1_000_000), (500_000, 2_000_000)), 25)
+
+    def _power_domains(self, domains, watts):
+        """Install root power domains: ``domains`` maps handle value -> domain type."""
+        state = {"tick": 0}
+
+        def enum(d, count, handles):
+            count._obj.value = len(domains)
+            if handles is not None:
+                for i, value in enumerate(domains):
+                    handles[i] = self.fake.zes_pwr_handle_t(value)
+            return 0
+
+        def props(p, out):
+            ext = ctypes.cast(
+                out._obj.pNext, ctypes.POINTER(self.fake.zes_power_ext_properties_t)
+            )
+            ext.contents.domain = domains[p.value]
+            return 0
+
+        def energy(p, c):
+            c._obj.timestamp = state["tick"] * 1_000_000
+            c._obj.energy = state["tick"] * watts[p.value] * 1_000_000
+            return 0
+
+        self.fake.zesDeviceEnumPowerDomains = enum
+        self.fake.zesPowerGetProperties = props
+        self.fake.zesPowerGetEnergyCounter = energy
+
+        def sample(tick):
+            state["tick"] = tick
+            return self.provider.get_gpu_utilization()[0]["power_mw"]
+
+        return sample
+
+    def test_power_prefers_card_domain_over_package_first(self):
+        # Package is enumerated first (80 W), the 120 W card domain second.
+        sample = self._power_domains({1: 2, 2: 1}, {1: 80, 2: 120})
+
+        self.assertIsNone(sample(1))
+        self.assertEqual(sample(2), 120_000)
+
+    def test_power_falls_back_to_package_without_card_domain(self):
+        # Unknown (0) first, package second: package wins; no card telemetry.
+        sample = self._power_domains({1: 0, 2: 2}, {1: 50, 2: 80})
+
+        self.assertIsNone(sample(1))
+        self.assertEqual(sample(2), 80_000)
 
     def test_power_domain_switch_does_not_mix_energy_counters(self):
         """A skipped first domain must not make the second diff against its counter."""

@@ -649,8 +649,9 @@ class IntelGpuProvider(GpuProvider):
         super().__init__()
         self._pyzes = None
         self._devices = []
-        # device index -> (counter, timestamp_us) of the previous sample.
-        self._prev_engine: Dict[int, Tuple[int, int]] = {}
+        # (device index, engine handle) -> (activeTime_us, timestamp_us) of the
+        # previous sample. Engines are sampled independently, so each keeps its own.
+        self._prev_engine: Dict[Tuple[int, Optional[int]], Tuple[int, int]] = {}
         # (device index, power domain handle) -> (energy_uj, timestamp_us). The
         # domain is part of the key so a domain switch never diffs two counters.
         self._prev_energy: Dict[Tuple[int, Optional[int]], Tuple[int, int]] = {}
@@ -776,21 +777,25 @@ class IntelGpuProvider(GpuProvider):
         return used // MB, total // MB
 
     def _drop_engine_baseline(self, index: int) -> None:
-        """Forget the last engine sample after a failed read.
+        """Forget every engine sample of a device after a failed read.
 
-        The counters are lifetime totals summed over the sub-devices, so a
-        partial sum would be diffed against a full one and report a false
-        dip, then a spike once the read recovers.
+        The average is only meaningful over all ``ALL`` groups, so one failed
+        read invalidates the whole device rather than leaving a partial set.
         """
-        self._prev_engine.pop(index, None)
+        for key in [k for k in self._prev_engine if k[0] == index]:
+            del self._prev_engine[key]
         return None
 
     def _get_utilization(self, index: int, handle) -> Optional[Percentage]:
-        """Busy percentage of the ``ALL`` engine group since the last sample."""
+        """Busy percentage of the ``ALL`` engine groups since the last sample.
+
+        Each group (one per sub-device) is diffed against its own previous
+        counter and timestamp, then the percentages are averaged.
+        """
         import ctypes
 
         pyzes = self._pyzes
-        active = timestamp = n = 0
+        samples = {}
         for engine in self._enumerate(
             pyzes.zesDeviceEnumEngineGroups, handle, pyzes.zes_engine_handle_t
         ):
@@ -808,50 +813,77 @@ class IntelGpuProvider(GpuProvider):
                 pyzes.ZE_RESULT_SUCCESS
             ):
                 return self._drop_engine_baseline(index)
-            # One ALL group per sub-device: average their busy time.
-            active += int(stats.activeTime)
-            timestamp = max(timestamp, int(stats.timestamp))
-            n += 1
-        if n == 0:
+            samples[(index, engine.value)] = (
+                int(stats.activeTime),
+                int(stats.timestamp),
+            )
+        if not samples:
             return None
-        previous = self._prev_engine.get(index)
-        self._prev_engine[index] = (active, timestamp)
-        if previous is None or timestamp <= previous[1]:
-            return None
-        busy = (active - previous[0]) / n / (timestamp - previous[1])
-        return max(0, min(100, int(round(busy * 100))))
+        previous = {key: self._prev_engine.get(key) for key in samples}
+        self._prev_engine.update(samples)
+        busy = []
+        for key, (active, timestamp) in samples.items():
+            before = previous[key]
+            if before is None or timestamp <= before[1]:
+                return None
+            busy.append((active - before[0]) / (timestamp - before[1]))
+        return max(0, min(100, int(round(sum(busy) / len(busy) * 100))))
+
+    def _select_power_domain(self, handle):
+        """Pick the root power domain to report: CARD, else PACKAGE, else the first.
+
+        Sub-device domains are skipped. The domain type comes from the
+        ``zes_power_ext_properties_t`` chained to the properties; a driver that
+        does not fill it leaves the domain UNKNOWN, which ranks last.
+        """
+        import ctypes
+
+        pyzes = self._pyzes
+        best, best_rank = None, None
+        for domain in self._enumerate(
+            pyzes.zesDeviceEnumPowerDomains, handle, pyzes.zes_pwr_handle_t
+        ):
+            ext = pyzes.zes_power_ext_properties_t()
+            ext.stype = pyzes.ZES_STRUCTURE_TYPE_POWER_EXT_PROPERTIES
+            ext.pNext = None
+            props = pyzes.zes_power_properties_t()
+            props.stype = pyzes.ZES_STRUCTURE_TYPE_POWER_PROPERTIES
+            props.pNext = ctypes.addressof(ext)
+            if pyzes.zesPowerGetProperties(domain, ctypes.byref(props)) != (
+                pyzes.ZE_RESULT_SUCCESS
+            ) or bool(props.onSubdevice):
+                continue
+            rank = {
+                pyzes.ZES_POWER_DOMAIN_CARD: 0,
+                pyzes.ZES_POWER_DOMAIN_PACKAGE: 1,
+            }.get(ext.domain, 2)
+            if best_rank is None or rank < best_rank:
+                best, best_rank = domain, rank
+        return best
 
     def _get_power_mw(self, index: int, handle) -> Optional[int]:
         """Average power in mW since the last sample, from the energy counter."""
         import ctypes
 
         pyzes = self._pyzes
-        for domain in self._enumerate(
-            pyzes.zesDeviceEnumPowerDomains, handle, pyzes.zes_pwr_handle_t
+        domain = self._select_power_domain(handle)
+        if domain is None:
+            return None
+        energy = pyzes.zes_power_energy_counter_t()
+        if pyzes.zesPowerGetEnergyCounter(domain, ctypes.byref(energy)) != (
+            pyzes.ZE_RESULT_SUCCESS
         ):
-            props = pyzes.zes_power_properties_t()
-            props.stype = pyzes.ZES_STRUCTURE_TYPE_POWER_PROPERTIES
-            props.pNext = None
-            if pyzes.zesPowerGetProperties(domain, ctypes.byref(props)) != (
-                pyzes.ZE_RESULT_SUCCESS
-            ) or bool(props.onSubdevice):
-                continue
-            energy = pyzes.zes_power_energy_counter_t()
-            if pyzes.zesPowerGetEnergyCounter(domain, ctypes.byref(energy)) != (
-                pyzes.ZE_RESULT_SUCCESS
-            ):
-                return None
-            key = (index, domain.value)
-            previous = self._prev_energy.get(key)
-            self._prev_energy[key] = (int(energy.energy), int(energy.timestamp))
-            if previous is None or int(energy.timestamp) <= previous[1]:
-                return None
-            # microjoules / microseconds = watts
-            watts = (int(energy.energy) - previous[0]) / (
-                int(energy.timestamp) - previous[1]
-            )
-            return int(watts * 1000)
-        return None
+            return None
+        key = (index, domain.value)
+        previous = self._prev_energy.get(key)
+        self._prev_energy[key] = (int(energy.energy), int(energy.timestamp))
+        if previous is None or int(energy.timestamp) <= previous[1]:
+            return None
+        # microjoules / microseconds = watts
+        watts = (int(energy.energy) - previous[0]) / (
+            int(energy.timestamp) - previous[1]
+        )
+        return int(watts * 1000)
 
     def _get_temperature_c(self, handle) -> Optional[int]:
         import ctypes
