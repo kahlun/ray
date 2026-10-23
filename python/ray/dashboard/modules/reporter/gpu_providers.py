@@ -651,7 +651,9 @@ class IntelGpuProvider(GpuProvider):
         self._devices = []
         # device index -> (counter, timestamp_us) of the previous sample.
         self._prev_engine: Dict[int, Tuple[int, int]] = {}
-        self._prev_energy: Dict[int, Tuple[int, int]] = {}
+        # (device index, power domain handle) -> (energy_uj, timestamp_us). The
+        # domain is part of the key so a domain switch never diffs two counters.
+        self._prev_energy: Dict[Tuple[int, Optional[int]], Tuple[int, int]] = {}
 
     def get_provider_name(self) -> GpuProviderType:
         return GpuProviderType.INTEL
@@ -839,8 +841,9 @@ class IntelGpuProvider(GpuProvider):
                 pyzes.ZE_RESULT_SUCCESS
             ):
                 return None
-            previous = self._prev_energy.get(index)
-            self._prev_energy[index] = (int(energy.energy), int(energy.timestamp))
+            key = (index, domain.value)
+            previous = self._prev_energy.get(key)
+            self._prev_energy[key] = (int(energy.energy), int(energy.timestamp))
             if previous is None or int(energy.timestamp) <= previous[1]:
                 return None
             # microjoules / microseconds = watts
