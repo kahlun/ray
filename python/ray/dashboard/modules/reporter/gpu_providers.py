@@ -643,6 +643,11 @@ class IntelGpuProvider(GpuProvider):
     counters, so the first sample after initialization reports them as
     ``None``. Utilization also stays ``None`` when Sysman exposes no engine
     groups, as on Arc Pro B60 with the current driver stack.
+
+    Utilization is the busy time of the compute engines, the Intel counterpart
+    of NVML's "a kernel was resident" figure. Devices are indexed in PCI
+    address order, the order frameworks such as PyTorch use, not in the
+    arbitrary order Sysman enumerates them.
     """
 
     def __init__(self):
@@ -686,6 +691,39 @@ class IntelGpuProvider(GpuProvider):
             )
         return devices
 
+    def _pci_address(self, handle) -> Optional[Tuple[int, int, int, int]]:
+        """Return (domain, bus, device, function), or None if it can't be read."""
+        import ctypes
+
+        pyzes = self._pyzes
+        props = pyzes.zes_pci_properties_t()
+        props.stype = pyzes.ZES_STRUCTURE_TYPE_PCI_PROPERTIES
+        props.pNext = None
+        if pyzes.zesDevicePciGetProperties(handle, ctypes.byref(props)) != (
+            pyzes.ZE_RESULT_SUCCESS
+        ):
+            return None
+        address = props.address
+        return (
+            int(address.domain),
+            int(address.bus),
+            int(address.device),
+            int(address.function),
+        )
+
+    def _sort_by_pci_address(self, devices: list) -> list:
+        """Order devices by PCI address; unreadable ones keep their order, last."""
+        keyed = []
+        for handle in devices:
+            try:
+                address = self._pci_address(handle)
+            except Exception as e:
+                logger.debug(f"Failed to read Intel GPU PCI address: {e}")
+                address = None
+            keyed.append((address is None, address or (), handle))
+        keyed.sort(key=lambda item: item[:2])
+        return [handle for _, _, handle in keyed]
+
     def _load_pyzes(self) -> bool:
         """Import pyzes and initialize Sysman.
 
@@ -715,7 +753,7 @@ class IntelGpuProvider(GpuProvider):
         try:
             if not self._load_pyzes():
                 return False
-            self._devices = self._enumerate_devices()
+            self._devices = self._sort_by_pci_address(self._enumerate_devices())
             self._initialized = True
             return True
         except Exception as e:
@@ -779,7 +817,7 @@ class IntelGpuProvider(GpuProvider):
     def _drop_engine_baseline(self, index: int) -> None:
         """Forget every engine sample of a device after a failed read.
 
-        The average is only meaningful over all ``ALL`` groups, so one failed
+        The average is only meaningful over all compute groups, so one failed
         read invalidates the whole device rather than leaving a partial set.
         """
         for key in [k for k in self._prev_engine if k[0] == index]:
@@ -787,10 +825,13 @@ class IntelGpuProvider(GpuProvider):
         return None
 
     def _get_utilization(self, index: int, handle) -> Optional[Percentage]:
-        """Busy percentage of the ``ALL`` engine groups since the last sample.
+        """Busy percentage of the compute engine groups since the last sample.
 
-        Each group (one per sub-device) is diffed against its own previous
-        counter and timestamp, then the percentages are averaged.
+        ``COMPUTE_ALL`` is used rather than ``ALL``: ``ALL`` averages in the
+        copy, media and render engines, so a compute-bound job reads low
+        (about 11% on a fully loaded Arc Pro B60). Each group (one per
+        sub-device) is diffed against its own previous counter and timestamp,
+        then the percentages are averaged.
         """
         import ctypes
 
@@ -806,7 +847,7 @@ class IntelGpuProvider(GpuProvider):
                 pyzes.ZE_RESULT_SUCCESS
             ):
                 return self._drop_engine_baseline(index)
-            if props.type != pyzes.ZES_ENGINE_GROUP_ALL:
+            if props.type != pyzes.ZES_ENGINE_GROUP_COMPUTE_ALL:
                 continue
             stats = pyzes.zes_engine_stats_t()
             if pyzes.zesEngineGetActivity(engine, ctypes.byref(stats)) != (

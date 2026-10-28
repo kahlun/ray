@@ -750,7 +750,7 @@ class TestAmdGpuProvider(unittest.TestCase):
 def _make_fake_pyzes():
     """A minimal in-memory stand-in for ``pyzes`` (Level Zero Sysman).
 
-    One device with 8 GiB of device memory (2 GiB used), one ALL engine group,
+    One device with 8 GiB of device memory (2 GiB used), one COMPUTE_ALL engine group,
     one card-level power domain and one GPU temperature sensor. Engine activity
     and energy advance by a fixed step on every read.
     """
@@ -786,6 +786,14 @@ def _make_fake_pyzes():
             ("core", z._core),
             ("modelName", str_),
         ],
+    )
+    struct(
+        "_pci_address",
+        [("domain", u32), ("bus", u32), ("device", u32), ("function", u32)],
+    )
+    struct(
+        "zes_pci_properties_t",
+        [("stype", i32), ("pNext", ctypes.c_void_p), ("address", z._pci_address)],
     )
     struct(
         "zes_mem_properties_t",
@@ -824,6 +832,7 @@ def _make_fake_pyzes():
     )
     for const, value in {
         "ZES_STRUCTURE_TYPE_DEVICE_PROPERTIES": 1,
+        "ZES_STRUCTURE_TYPE_PCI_PROPERTIES": 2,
         "ZES_STRUCTURE_TYPE_MEM_PROPERTIES": 0xB,
         "ZES_STRUCTURE_TYPE_MEM_STATE": 0x1E,
         "ZES_STRUCTURE_TYPE_ENGINE_PROPERTIES": 5,
@@ -835,6 +844,7 @@ def _make_fake_pyzes():
         "ZES_STRUCTURE_TYPE_PROCESS_STATE": 0x16,
         "ZES_MEM_LOC_DEVICE": 1,
         "ZES_ENGINE_GROUP_ALL": 0,
+        "ZES_ENGINE_GROUP_COMPUTE_ALL": 1,
         "ZES_TEMP_SENSORS_GPU": 1,
     }.items():
         setattr(z, const, value)
@@ -883,7 +893,19 @@ def _make_fake_pyzes():
         return 0
 
     z.zesMemoryGetState = mem_state
-    z.zesEngineGetProperties = lambda e, p: 0
+
+    def engine_props(e, p):
+        p._obj.type = z.ZES_ENGINE_GROUP_COMPUTE_ALL
+        return 0
+
+    z.zesEngineGetProperties = engine_props
+
+    def pci_props(d, p):
+        # One bus address per device handle, in enumeration order.
+        p._obj.address.bus = d.value
+        return 0
+
+    z.zesDevicePciGetProperties = pci_props
 
     def activity(e, s):
         clock["n"] += 1
@@ -926,6 +948,14 @@ def _make_fake_pyzes():
 
 
 _PYZES = "ray._private.thirdparty.pyzes"
+
+
+def _fill(count, handles, cls, n):
+    count._obj.value = n
+    if handles is not None:
+        for i in range(n):
+            handles[i] = cls(i + 1)
+    return 0
 
 
 def _fill_handles(fake, count, handles, n):
@@ -1015,6 +1045,73 @@ class TestIntelGpuProvider(unittest.TestCase):
         # The other fields are unaffected.
         self.assertEqual(gpu["power_mw"], 80_000)
         self.assertEqual(gpu["memory_total"], 8 * 1024)
+
+    def test_only_compute_engine_group_is_reported(self):
+        """An ``ALL`` group averaging in idle copy/media engines must be ignored."""
+        self.fake.zesDeviceEnumEngineGroups = lambda d, count, h: (
+            _fill_handles(self.fake, count, h, 2)
+        )
+
+        def engine_props(e, p):
+            # Handle 1 is the 100%-busy compute group, handle 2 the ALL average.
+            p._obj.type = 1 if e.value == 1 else 0
+            return 0
+
+        def activity(e, s):
+            self.clock = getattr(self, "clock", 0) + 1
+            s._obj.timestamp = self.clock * 1_000_000
+            busy = 1_000_000 if e.value == 1 else 110_000
+            s._obj.activeTime = self.clock * busy
+            return 0
+
+        self.fake.zesEngineGetProperties = engine_props
+        self.fake.zesEngineGetActivity = activity
+        self.provider.get_gpu_utilization()
+        gpu = self.provider.get_gpu_utilization()[0]
+
+        self.assertEqual(gpu["utilization_gpu"], 100)
+
+    def test_only_all_engine_group_leaves_utilization_unset(self):
+        self.fake.zesEngineGetProperties = lambda e, p: (
+            setattr(p._obj, "type", 0) or 0
+        )
+        self.provider.get_gpu_utilization()
+        gpu = self.provider.get_gpu_utilization()[0]
+
+        self.assertIsNone(gpu["utilization_gpu"])
+
+    def _two_devices(self, bus_of):
+        """Install two devices; ``bus_of`` maps device handle value -> PCI bus."""
+        self.fake.zesDeviceGet = lambda d, count, h: _fill(
+            count, h, self.fake.zes_device_handle_t, len(bus_of)
+        )
+
+        def pci_props(d, p):
+            if bus_of[d.value] is None:
+                return 1
+            p._obj.address.bus = bus_of[d.value]
+            return 0
+
+        self.fake.zesDevicePciGetProperties = pci_props
+
+        def device_props(d, p):
+            p._obj.modelName = f"gpu{d.value}".encode()
+            return 0
+
+        self.fake.zesDeviceGetProperties = device_props
+
+    def test_devices_are_indexed_in_pci_order(self):
+        # Sysman lists the bus 0x1b card first; PCI order puts it last.
+        self._two_devices({1: 0x1B, 2: 0x10})
+        names = [g["name"] for g in self.provider.get_gpu_utilization()]
+
+        self.assertEqual(names, ["gpu2", "gpu1"])
+
+    def test_unreadable_pci_address_keeps_order_and_sorts_last(self):
+        self._two_devices({1: None, 2: 0x10})
+        names = [g["name"] for g in self.provider.get_gpu_utilization()]
+
+        self.assertEqual(names, ["gpu2", "gpu1"])
 
     def test_engine_utilization_is_averaged_per_engine_interval(self):
         """Two 25%-busy engines sampled over 1 s and 2 s must still read 25%."""
@@ -1121,7 +1218,7 @@ class TestIntelGpuProvider(unittest.TestCase):
         self.assertEqual(sample(3), 80_000)  # domain 1 again, over two ticks
 
     def test_partial_engine_read_failure_resets_utilization_baseline(self):
-        """A failed read on one of several ALL groups must not skew the next value."""
+        """A failed read on one of several compute groups must not skew the next value."""
         state = {"tick": 0, "failing": None}
 
         def activity(e, s):
